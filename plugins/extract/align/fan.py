@@ -1,260 +1,355 @@
 #!/usr/bin/env python3
-""" Facial landmarks extractor for faceswap.py
-    Code adapted and modified from:
-    https://github.com/1adrianb/face-alignment
+"""Facial landmarks extractor for faceswap.py
+   Code adapted and modified from:
+   https://github.com/1adrianb/face-alignment
 """
-import os
-import cv2
+from __future__ import annotations
+import logging
+import typing as T
+
 import numpy as np
 
-from ._base import Aligner, logger
+import torch
+from torch import nn
+from torch.nn import functional as F
+
+from lib.utils import get_module_objects, GetModel
+from plugins.extract.base import ExtractPlugin
+
+from . import fan_defaults as cfg
+from . dark_decoder import Dark
 
 
-class Align(Aligner):
-    """ Perform transformation to align and get landmarks """
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.vram = 2240
-        self.reference_scale = 195.0
-        self.model = None
-        self.test = None
+logger = logging.getLogger(__name__)
 
-    def set_model_path(self):
-        """ Load the mtcnn models """
-        model_path = os.path.join(self.cachepath, "2DFAN-4.pb")
-        if not os.path.exists(model_path):
-            raise Exception("Error: Unable to find {}, reinstall "
-                            "the lib!".format(model_path))
-        logger.debug("Loading model: '%s'", model_path)
-        return model_path
 
-    def initialize(self, *args, **kwargs):
-        """ Initialization tasks to run prior to alignments """
-        super().initialize(*args, **kwargs)
-        logger.info("Initializing Face Alignment Network...")
-        logger.debug("fan initialize: (args: %s kwargs: %s)", args, kwargs)
+class FAN(ExtractPlugin):
+    """FAN Face alignment"""
+    def __init__(self) -> None:
+        super().__init__(input_size=256,
+                         batch_size=cfg.batch_size(),
+                         is_rgb=True,
+                         dtype="float32",
+                         scale=(0, 1))
+        self.model: FaceAlignmentNetwork
+        self.realign_centering = "head"
+        # Original reference scale leads to some fairly unsatisfying landmarks so tightened up
+        # self._reference_scale = 200. / 195.
+        self._reference_scale = 0.8
+        self._dark = Dark(68, 64) if cfg.dark_decoder() else None
 
-        _, _, vram_total = self.get_vram_free()
+    def load_model(self) -> FaceAlignmentNetwork:
+        """Load the FAN model
 
-        if vram_total <= self.vram:
-            tf_ratio = 1.0
+        Returns
+        -------
+        The loaded FAN model
+        """
+        weights = GetModel("face-alignment-network_2d4_v4.pth", 13).model_path
+        assert isinstance(weights, str)
+        model = T.cast(FaceAlignmentNetwork,
+                       self.load_torch_model(FaceAlignmentNetwork(num_stack=4,
+                                                                  num_modules=1,
+                                                                  hg_depth=4,
+                                                                  num_features=256,
+                                                                  num_classes=68),
+                                             weights,
+                                             return_indices=[-1]))
+        return model
+
+    def pre_process(self, batch: np.ndarray) -> np.ndarray:
+        """Format the ROI faces detection boxes for prediction
+
+        Parameters
+        ----------
+        batch
+            The batch of face detection bounding boxes as (bs, l, t, r, b)
+
+        Returns
+        -------
+        The face detection bounding boxes formatted to take an image patch for prediction
+        """
+        heights = batch[:, 3] - batch[:, 1]
+        widths = batch[:, 2] - batch[:, 0]
+        ctr_x = np.rint((batch[:, 0] + batch[:, 2]) * 0.5).astype("int32")
+        # This y-shift only really makes sense for derived bounding boxes, so removed:
+        # ctr_y = np.rint((batch[:, 1] + batch[:, 3]) * 0.5 - heights * 0.12).astype("int32")
+        ctr_y = np.rint((batch[:, 1] + batch[:, 3]) * 0.5).astype("int32")
+        size = (widths + heights) * self._reference_scale
+        half = np.rint(size * 0.5).astype("int32")
+        # Original implementation is (1, 1) top left, not (0, 0)
+        tl_offset = np.rint(size / self.input_size).astype("int32")
+
+        retval = np.empty((batch.shape[0], 4), dtype=np.int32)
+        retval[:, 0] = ctr_x - half + tl_offset
+        retval[:, 1] = ctr_y - half + tl_offset
+        retval[:, 2] = ctr_x + half
+        retval[:, 3] = ctr_y + half
+        return retval
+
+    def process(self, batch: np.ndarray) -> np.ndarray:
+        """Predict the 68 point landmarks
+
+        Parameters
+        ----------
+        batch
+            The batch to feed into the aligner
+
+        Returns
+        -------
+        The predictions from the aligner
+        """
+        return self.from_torch(batch.transpose(0, 3, 1, 2))
+
+    def post_process(self, batch: np.ndarray) -> np.ndarray:  # pylint:disable=too-many-locals
+        """Process the output from the model
+
+        Parameters
+        ----------
+        batch
+            The predictions from the aligner
+
+        Returns
+        -------
+        The final landmarks in 0-1 space
+        """
+        if self._dark is not None:
+            return self._dark(batch) / 64.
+        num_images, num_landmarks, height, width = batch.shape
+        assert height == width, "Heatmaps must be square"
+        resolution = height
+
+        image_slice = np.arange(num_images)[:, None]
+        landmark_slice = np.arange(num_landmarks)[None, :]
+
+        subpixel_landmarks = np.ones((num_images, num_landmarks, 2), dtype='float32')
+
+        indices = np.array(np.unravel_index(batch.reshape(num_images,
+                                                          num_landmarks,
+                                                          -1).argmax(-1),
+                                            (batch.shape[2],  # height
+                                             batch.shape[3])))  # width
+        min_clipped = np.minimum(indices + 1, batch.shape[2] - 1)
+        max_clipped = np.maximum(indices - 1, 0)
+
+        offsets = [(image_slice, landmark_slice, indices[0], min_clipped[1]),  # Right
+                   (image_slice, landmark_slice, indices[0], max_clipped[1]),  # Left
+                   (image_slice, landmark_slice, min_clipped[0], indices[1]),  # Down
+                   (image_slice, landmark_slice, max_clipped[0], indices[1])]  # Up
+        right, left = batch[offsets[0]], batch[offsets[1]]
+        down, up = batch[offsets[2]], batch[offsets[3]]
+        epsilon = 1e-6  # Small epsilon to avoid zero div
+        x_delta = np.clip((right - left) / (right + left + epsilon), -0.5, 0.5)
+        y_delta = np.clip((down - up) / (down + up + epsilon), -0.5, 0.5)
+
+        subpixel_landmarks[..., 0] = indices[1] + x_delta + 0.5
+        subpixel_landmarks[..., 1] = indices[0] + y_delta + 0.5
+        subpixel_landmarks /= resolution
+        return subpixel_landmarks
+
+
+class ConvBlock(nn.Module):
+    """Convolution block for FAN
+
+    Parameters
+    ----------
+    num_in
+        The number of in channels
+    num_out
+        The number of out channels
+    """
+    def __init__(self, num_in: int, num_out: int) -> None:
+        super().__init__()
+        self.bn1 = nn.BatchNorm2d(num_in)
+        self.conv1 = nn.Conv2d(num_in, num_out // 2, 3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(num_out // 2)
+        self.conv2 = nn.Conv2d(num_out // 2, num_out // 4, 3, stride=1, padding=1, bias=False)
+        self.bn3 = nn.BatchNorm2d(num_out // 4)
+        self.conv3 = nn.Conv2d(num_out // 4, num_out // 4, 3, stride=1, padding=1, bias=False)
+        self.downsample = None
+        if num_in != num_out:
+            self.downsample = nn.Sequential(nn.BatchNorm2d(num_in),
+                                            nn.ReLU(inplace=True),
+                                            nn.Conv2d(num_in, num_out, 1, stride=1, bias=False))
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        """Forward pass through FAN's conv block
+
+        Parameters
+        ----------
+        inputs
+            Input to the conv block
+
+        Returns
+        -------
+        Output from the conv block
+        """
+        residual = inputs if self.downsample is None else self.downsample(inputs)
+        var_x = self.conv1(F.relu(self.bn1(inputs), inplace=True))
+        var_y = self.conv2(F.relu(self.bn2(var_x), inplace=True))
+        var_z = self.conv3(F.relu(self.bn3(var_y), inplace=True))
+        out = torch.cat((var_x, var_y, var_z), dim=1) + residual
+        return out
+
+
+class HourGlass(nn.Module):
+    """Hour-glass module for FAN
+
+    Parameters
+    ----------
+    num_modules
+        The number of modules in the hour-glass network
+    depth
+        The depth of the hour-glass network
+    num_features
+        The number of features to generate
+    """
+    def __init__(self, num_modules: int, depth: int, num_features: int) -> None:
+        super().__init__()
+        self._num_modules = num_modules
+        self._num_features = num_features
+        self._depth = depth
+        self._generate_network(depth)
+
+    def _generate_network(self, level: int) -> None:
+        """Recursively generate the hour-glass network
+
+        Parameters
+        ----------
+        level
+            The depth of the hour-glass network
+        """
+        for i in range(self._num_modules):
+            self.add_module(f"b1_{level}_{i}", ConvBlock(self._num_features, self._num_features))
+        for i in range(self._num_modules):
+            self.add_module(f"b2_{level}_{i}", ConvBlock(self._num_features, self._num_features))
+
+        if level > 1:
+            self._generate_network(level - 1)
         else:
-            tf_ratio = self.vram / vram_total
-        logger.verbose("Reserving %sMB for face alignments", self.vram)
+            for i in range(self._num_modules):
+                self.add_module(f"b2_plus_{level}_{i}",
+                                ConvBlock(self._num_features, self._num_features))
 
-        self.model = FAN(self.model_path, ratio=tf_ratio)
+        for i in range(self._num_modules):
+            self.add_module(f"b3_{level}_{i}", ConvBlock(self._num_features, self._num_features))
 
-        self.init.set()
-        logger.info("Initialized Face Alignment Network.")
+    def _forward(self, level: int, inputs: torch.Tensor) -> torch.Tensor:
+        """Forward pass through FAN's hour-glass network
 
-    def align(self, *args, **kwargs):
-        """ Perform alignments on detected faces """
-        super().align(*args, **kwargs)
-        for item in self.get_item():
-            if item == "EOF":
-                self.finalize(item)
-                break
-            image = item["image"][:, :, ::-1].copy()
+        Parameters
+        ----------
+        inputs
+            Input to the hour-glass network
 
-            logger.trace("Aligning faces")
-            try:
-                item["landmarks"] = self.process_landmarks(image, item["detected_faces"])
-                logger.trace("Aligned faces: %s", item["landmarks"])
-            except ValueError as err:
-                logger.warning("Image '%s' could not be processed. This may be due to corrupted "
-                               "data: %s", item["filename"], str(err))
-                item["detected_faces"] = list()
-                item["landmarks"] = list()
-            self.finalize(item)
-        logger.debug("Completed Align")
+        Returns
+        -------
+        Output from the hour-glass network
+        """
+        up1 = inputs
+        for i in range(self._num_modules):
+            up1 = getattr(self, f"b1_{level}_{i}")(up1)
 
-    def process_landmarks(self, image, detected_faces):
-        """ Align image and process landmarks """
-        logger.trace("Processing landmarks")
-        retval = list()
-        for detected_face in detected_faces:
-            center, scale = self.get_center_scale(detected_face)
-            aligned_image = self.align_image(image, center, scale)
-            landmarks = self.predict_landmarks(aligned_image, center, scale)
-            retval.append(landmarks)
-        logger.trace("Processed landmarks: %s", retval)
-        return retval
+        lo1 = F.avg_pool2d(inputs, 2, stride=2)  # pylint:disable=not-callable
+        for i in range(self._num_modules):
+            lo1 = getattr(self, f"b2_{level}_{i}")(lo1)
 
-    def get_center_scale(self, detected_face):
-        """ Get the center and set scale of bounding box """
-        logger.trace("Calculating center and scale")
-        center = np.array([(detected_face.left()
-                            + detected_face.right()) / 2.0,
-                           (detected_face.top()
-                            + detected_face.bottom()) / 2.0])
-
-        center[1] -= (detected_face.bottom()
-                      - detected_face.top()) * 0.12
-
-        scale = (detected_face.right()
-                 - detected_face.left()
-                 + detected_face.bottom()
-                 - detected_face.top()) / self.reference_scale
-
-        logger.trace("Calculated center and scale: %s, %s", center, scale)
-        return center, scale
-
-    def align_image(self, image, center, scale):
-        """ Crop and align image around center """
-        logger.trace("Aligning image around center")
-        image = self.crop(
-            image,
-            center,
-            scale).transpose((2, 0, 1)).astype(np.float32) / 255.0
-        logger.trace("Aligned image around center")
-        return np.expand_dims(image, 0)
-
-    def predict_landmarks(self, image, center, scale):
-        """ Predict the 68 point landmarks """
-        logger.trace("Predicting Landmarks")
-        prediction = self.model.predict(image)[-1]
-        pts_img = self.get_pts_from_predict(prediction, center, scale)
-        retval = [(int(pt[0]), int(pt[1])) for pt in pts_img]
-        logger.trace("Predicted Landmarks: %s", retval)
-        return retval
-
-    @staticmethod
-    def transform(point, center, scale, resolution):
-        """ Transform Image """
-        logger.trace("Transforming Points")
-        pnt = np.array([point[0], point[1], 1.0])
-        hscl = 200.0 * scale
-        eye = np.eye(3)
-        eye[0, 0] = resolution / hscl
-        eye[1, 1] = resolution / hscl
-        eye[0, 2] = resolution * (-center[0] / hscl + 0.5)
-        eye[1, 2] = resolution * (-center[1] / hscl + 0.5)
-        eye = np.linalg.inv(eye)
-        retval = np.matmul(eye, pnt)[0:2]
-        logger.trace("Transformed Points: %s", retval)
-        return retval
-
-    def crop(self, image, center, scale, resolution=256.0):  # pylint: disable=too-many-locals
-        """ Crop image around the center point """
-        logger.trace("Cropping image")
-        v_ul = self.transform([1, 1], center, scale, resolution).astype(np.int)
-        v_br = self.transform([resolution, resolution],
-                              center,
-                              scale,
-                              resolution).astype(np.int)
-        if image.ndim > 2:
-            new_dim = np.array([v_br[1] - v_ul[1],
-                                v_br[0] - v_ul[0],
-                                image.shape[2]],
-                               dtype=np.int32)
-            self.test = new_dim
-            new_img = np.zeros(new_dim, dtype=np.uint8)
+        if level > 1:
+            lo2 = self._forward(level - 1, lo1)
         else:
-            new_dim = np.array([v_br[1] - v_ul[1],
-                                v_br[0] - v_ul[0]],
-                               dtype=np.int)
-            self.test = new_dim
-            new_img = np.zeros(new_dim, dtype=np.uint8)
-        height = image.shape[0]
-        width = image.shape[1]
-        new_x = np.array([max(1, -v_ul[0] + 1), min(v_br[0], width) - v_ul[0]],
-                         dtype=np.int32)
-        new_y = np.array([max(1, -v_ul[1] + 1),
-                          min(v_br[1], height) - v_ul[1]],
-                         dtype=np.int32)
-        old_x = np.array([max(1, v_ul[0] + 1), min(v_br[0], width)],
-                         dtype=np.int32)
-        old_y = np.array([max(1, v_ul[1] + 1), min(v_br[1], height)],
-                         dtype=np.int32)
-        new_img[new_y[0] - 1:new_y[1],
-                new_x[0] - 1:new_x[1]] = image[old_y[0] - 1:old_y[1],
-                                               old_x[0] - 1:old_x[1], :]
-        # pylint: disable=no-member
-        new_img = cv2.resize(new_img,
-                             dsize=(int(resolution), int(resolution)),
-                             interpolation=cv2.INTER_LINEAR)
-        logger.trace("Cropped image")
-        return new_img
+            lo2 = lo1
+            for i in range(self._num_modules):
+                lo2 = getattr(self, f"b2_plus_{level}_{i}")(lo2)
 
-    def get_pts_from_predict(self, var_a, center, scale):
-        """ Get points from predictor """
-        logger.trace("Obtain points from prediction")
-        var_b = var_a.reshape((var_a.shape[0],
-                               var_a.shape[1] * var_a.shape[2]))
-        var_c = var_b.argmax(1).reshape((var_a.shape[0],
-                                         1)).repeat(2,
-                                                    axis=1).astype(np.float)
-        var_c[:, 0] %= var_a.shape[2]
-        var_c[:, 1] = np.apply_along_axis(
-            lambda x: np.floor(x / var_a.shape[2]),
-            0,
-            var_c[:, 1])
+        lo3 = lo2
+        for i in range(self._num_modules):
+            lo3 = getattr(self, f"b3_{level}_{i}")(lo3)
 
-        for i in range(var_a.shape[0]):
-            pt_x, pt_y = int(var_c[i, 0]), int(var_c[i, 1])
-            if pt_x > 0 and pt_x < 63 and pt_y > 0 and pt_y < 63:
-                diff = np.array([var_a[i, pt_y, pt_x+1]
-                                 - var_a[i, pt_y, pt_x-1],
-                                 var_a[i, pt_y+1, pt_x]
-                                 - var_a[i, pt_y-1, pt_x]])
+        up2 = F.interpolate(lo3, scale_factor=2, mode="nearest")
+        return up1 + up2
 
-                var_c[i] += np.sign(diff)*0.25
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        """Forward pass through FAN's hour-glass network
 
-        var_c += 0.5
-        retval = [self.transform(var_c[i], center, scale, var_a.shape[2])
-                  for i in range(var_a.shape[0])]
-        logger.trace("Obtained points from prediction: %s", retval)
+        Parameters
+        ----------
+        inputs
+            Input to the hour-glass network
 
-        return retval
+        Returns
+        -------
+        Output from the hour-glass network
+        """
+        return self._forward(self._depth, inputs)
 
 
-class FAN():
-    """The FAN Model.
-    Converted from pyTorch via ONNX from:
-    https://github.com/1adrianb/face-alignment """
+class FaceAlignmentNetwork(nn.Module):
+    """2D FAN alignment for faceswap"""
+    def __init__(self,
+                 num_stack: int = 4,
+                 num_modules: int = 1,
+                 hg_depth: int = 4,
+                 num_features: int = 256,
+                 num_classes: int = 68) -> None:
+        super().__init__()
+        self._num_stacks = num_stack
+        self._num_modules = num_modules
 
-    def __init__(self, model_path, ratio=1.0):
-        # Must import tensorflow inside the spawned process
-        # for Windows machines
-        import tensorflow as tf
-        self.tf = tf  # pylint: disable=invalid-name
+        self.conv1 = nn.Conv2d(3, 64, 7, stride=2, padding=3)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.conv2 = ConvBlock(64, 128)
+        self.conv3 = ConvBlock(128, 128)
+        self.conv4 = ConvBlock(128, num_features)
 
-        self.model_path = model_path
-        self.graph = self.load_graph()
-        self.input = self.graph.get_tensor_by_name("fa/input_1:0")
-        self.output = self.graph.get_tensor_by_name("fa/transpose_647:0")
-        self.session = self.set_session(ratio)
+        for i in range(self._num_stacks):
+            self.add_module(f"m{i}", HourGlass(num_modules, hg_depth, num_features))
+            for j in range(num_modules):
+                # backwards labelled in original impl:
+                self.add_module(f"top_m{j}_{i}", ConvBlock(num_features, num_features))
+            self.add_module(f"conv_last{i}", nn.Conv2d(num_features, num_features, 1))
+            self.add_module(f"bn_end{i}", nn.BatchNorm2d(num_features))
+            self.add_module(f"l{i}", nn.Conv2d(num_features, num_classes, 1))
+            if i == self._num_stacks - 1:
+                continue
+            self.add_module(f"bl{i}", nn.Conv2d(num_features, num_features, 1))
+            self.add_module(f"al{i}", nn.Conv2d(num_classes, num_features, 1))
 
-    def load_graph(self):
-        """ Load the tensorflow Model and weights """
-        # pylint: disable=not-context-manager
-        logger.verbose("Initializing Face Alignment Network model...")
+    def forward(self, inputs: torch.Tensor) -> list[torch.Tensor]:
+        """Forward pass through FAN face alignment
 
-        with self.tf.gfile.GFile(self.model_path, "rb") as gfile:
-            graph_def = self.tf.GraphDef()
-            graph_def.ParseFromString(gfile.read())
-        fa_graph = self.tf.Graph()
-        with fa_graph.as_default():
-            self.tf.import_graph_def(graph_def, name="fa")
-        return fa_graph
+        Parameters
+        ----------
+        inputs
+            Input to FAN
 
-    def set_session(self, vram_ratio):
-        """ Set the TF Session and initialize """
-        # pylint: disable=not-context-manager, no-member
-        placeholder = np.zeros((1, 3, 256, 256))
-        with self.graph.as_default():
-            config = self.tf.ConfigProto()
-            config.gpu_options.per_process_gpu_memory_fraction = vram_ratio
-            session = self.tf.Session(config=config)
-            with session.as_default():
-                if any("gpu" in str(device).lower() for device in session.list_devices()):
-                    logger.debug("Using GPU")
-                else:
-                    logger.warning("Using CPU")
-                session.run(self.output, feed_dict={self.input: placeholder})
-        return session
+        Returns
+        -------
+        Output from FAN
+        """
+        var_x = F.relu(self.bn1(self.conv1(inputs)), inplace=True)
+        var_x = F.avg_pool2d(self.conv2(var_x), 2, stride=2)  # pylint:disable=not-callable
+        var_x = self.conv4(self.conv3(var_x))
 
-    def predict(self, feed_item):
-        """ Predict landmarks in session """
-        return self.session.run(self.output,
-                                feed_dict={self.input: feed_item})
+        out = []
+        inter = var_x
+
+        for i in range(self._num_stacks):
+            hg = getattr(self, f"m{i}")(inter)
+            ll = hg
+            for j in range(self._num_modules):
+                ll = getattr(self, f"top_m{j}_{i}")(ll)
+
+            ll = F.relu(getattr(self, f"bn_end{i}")(getattr(self, f"conv_last{i}")(ll)),
+                        inplace=True)
+
+            out.append(getattr(self, f"l{i}")(ll))
+
+            if i == self._num_stacks - 1:
+                continue
+            ll = getattr(self, f"bl{i}")(ll)
+            inter = inter + ll + getattr(self, f"al{i}")(out[-1])
+
+        return out
+
+
+__all__ = get_module_objects(__name__)
